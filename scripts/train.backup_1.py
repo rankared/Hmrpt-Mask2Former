@@ -9,26 +9,23 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 import evaluate # For evaluation metrics [1]
 import numpy as np
 from PIL import Image
-import argparse # Import argparse for Namespace
 
-# Current script's directory to be in sys.path to prioritize  config.py
+# Ensure the current script's directory is in sys.path to prioritize your config.py
 import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 # Import configuration and custom modules
-import config # config.py [1]
+import config # Your custom config.py [1]
 from hmr_pt.models.hmr_mask2former import HMRMask2Former
 from hmr_pt.datasets.segmentation_dataset import CustomSegmentationDataset, collate_fn
-from hmr_pt.losses.hmr_losses import HMRLoss # HMRLoss 
+from hmr_pt.losses.hmr_losses import HMRLoss # Your custom loss [1]
 
 # --- PyTorch Lightning Module for HMR-PT ---
 class HMRPTLightningModule(L.LightningModule):
     def __init__(self, hparams):
         super().__init__()
-        # self.save_hyperparameters(hparams) # Original line
-        # Pass the Namespace object directly. Lightning will handle saving its attributes.
-        self.save_hyperparameters(hparams) 
+        self.save_hyperparameters(hparams) # Save all hyperparameters from config
 
         # Initialize HMRMask2Former model
         self.model = HMRMask2Former(
@@ -111,7 +108,7 @@ class HMRPTLightningModule(L.LightningModule):
         labels_flat = target_masks_resized.view(-1)
 
         # Filter out ignored pixels (e.g., 255 for Cityscapes)
-        valid_pixels = (labels_flat!= 255) # Assuming 255 is ignore_index [4]
+        valid_pixels = (labels_flat!= 255) # Assuming 255 is ignore_index
         
         # Ensure predictions are within valid class range for metric calculation
         # Some models might predict outside valid class IDs for ignored regions
@@ -160,54 +157,50 @@ def main():
     # Create output directory if it doesn't exist
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
 
-    # --- Convert config module to Namespace object ---
-    # This is the crucial change to resolve the ValueError
-    hparams = argparse.Namespace(**{key: getattr(config, key) for key in dir(config) if not key.startswith('__')})
-
     # Initialize the Lightning Module with hyperparameters from config
-    model_lightning = HMRPTLightningModule(hparams=hparams)
+    model_lightning = HMRPTLightningModule(hparams=config)
 
     # Prepare datasets and dataloaders
     # The image_processor is part of the HMRMask2Former model
     image_processor = model_lightning.model.processor
 
     # For Cityscapes dataset
-    if hparams.TASK_TYPE == "semantic": # [1]
+    if config.TASK_TYPE == "semantic": # [1]
         train_dataset = CustomSegmentationDataset(
-            root_dir=hparams.CITYSCAPES_ROOT,
+            root_dir=config.CITYSCAPES_ROOT,
             image_dir="leftImg8bit/train", # Adjust based on your extracted structure
             annotation_dir="gtFine/train", # Adjust based on your extracted structure
             image_processor=image_processor,
-            task_type=hparams.TASK_TYPE
+            task_type=config.TASK_TYPE
         )
         val_dataset = CustomSegmentationDataset(
-            root_dir=hparams.CITYSCAPES_ROOT,
+            root_dir=config.CITYSCAPES_ROOT,
             image_dir="leftImg8bit/val",
             annotation_dir="gtFine/val",
             image_processor=image_processor,
-            task_type=hparams.TASK_TYPE
+            task_type=config.TASK_TYPE
         )
-    elif hparams.TASK_TYPE == "instance" or hparams.TASK_TYPE == "panoptic":
+    elif config.TASK_TYPE == "instance" or config.TASK_TYPE == "panoptic":
         # For COCO or other datasets, you'd load them here.
-        # This would require a CustomSegmentationDataset that handles COCO JSON format [5]
+        # This would require a CustomSegmentationDataset that handles COCO JSON format [4]
         # For example:
         # train_dataset = CustomSegmentationDataset(
-        #     root_dir=hparams.COCO_ROOT,
+        #     root_dir=config.COCO_ROOT,
         #     image_dir="train2017",
         #     annotation_dir="annotations/instances_train2017.json", # Or panoptic_train2017.json
         #     image_processor=image_processor,
-        #     task_type=hparams.TASK_TYPE
+        #     task_type=config.TASK_TYPE
         # )
         # val_dataset = CustomSegmentationDataset(
-        #     root_dir=hparams.COCO_ROOT,
+        #     root_dir=config.COCO_ROOT,
         #     image_dir="val2017",
         #     annotation_dir="annotations/instances_val2017.json",
         #     image_processor=image_processor,
-        #     task_type=hparams.TASK_TYPE
+        #     task_type=config.TASK_TYPE
         # )
-        raise NotImplementedError(f"Dataset loading for {hparams.TASK_TYPE} is not yet implemented. Please implement it in segmentation_dataset.py.")
+        raise NotImplementedError(f"Dataset loading for {config.TASK_TYPE} is not yet implemented. Please implement it in segmentation_dataset.py.")
     else:
-        raise ValueError(f"Unsupported TASK_TYPE: {hparams.TASK_TYPE}")
+        raise ValueError(f"Unsupported TASK_TYPE: {config.TASK_TYPE}")
 
     # Create data loaders,
     # Use partial to pass image_processor to collate_fn
@@ -216,7 +209,7 @@ def main():
 
     train_dataloader = DataLoader(
         train_dataset,
-        batch_size=hparams.BATCH_SIZE,
+        batch_size=config.BATCH_SIZE,
         shuffle=True,
         num_workers=os.cpu_count() // 2, # Use half of CPU cores for data loading
         collate_fn=train_collate_fn,
@@ -224,7 +217,7 @@ def main():
     )
     val_dataloader = DataLoader(
         val_dataset,
-        batch_size=hparams.BATCH_SIZE,
+        batch_size=config.BATCH_SIZE,
         shuffle=False,
         num_workers=os.cpu_count() // 2,
         collate_fn=val_collate_fn,
@@ -233,12 +226,12 @@ def main():
 
     # --- PyTorch Lightning Trainer Setup ---
     # Logger for saving training progress to CSV,
-    csv_logger = CSVLogger(save_dir=hparams.OUTPUT_DIR, name="hmr_pt_logs")
+    csv_logger = CSVLogger(save_dir=config.OUTPUT_DIR, name="hmr_pt_logs")
 
     # Model checkpointing callback,
     # Saves the best model based on validation mean_iou
     checkpoint_callback = ModelCheckpoint(
-        dirpath=hparams.OUTPUT_DIR,
+        dirpath=config.OUTPUT_DIR,
         filename="best_hmr_pt_model-{epoch:02d}-{val_mean_iou:.4f}",
         monitor="val_mean_iou", # Metric to monitor for saving best model
         mode="max", # Save model when val_mean_iou is maximized
@@ -248,7 +241,7 @@ def main():
 
     # Initialize the Lightning Trainer
     trainer = L.Trainer(
-        max_epochs=hparams.NUM_EPOCHS,
+        max_epochs=config.NUM_EPOCHS,
         logger=csv_logger,
         callbacks=[checkpoint_callback],
         accelerator="gpu", # Use GPU if available
@@ -258,28 +251,28 @@ def main():
         log_every_n_steps=50, # Log every N steps
         val_check_interval=0.5, # Run validation every 0.5 epoch
         # For two-stage training, you might need to manage ckpt_path for resuming
-        # ckpt_path=hparams.CHECKPOINT_PATH_STAGE1 if hparams.TWO_STAGE_TRAINING else None
+        # ckpt_path=config.CHECKPOINT_PATH_STAGE1 if config.TWO_STAGE_TRAINING else None
     )
 
     # --- Training Loop ---
-    print(f"Starting training for {hparams.NUM_EPOCHS} epochs...")
+    print(f"Starting training for {config.NUM_EPOCHS} epochs...")
     trainer.fit(model_lightning, train_dataloader, val_dataloader)
     print("Training complete!")
 
     # --- Optional: Two-Stage Training Logic (Conceptual) ---
-    # If hparams.TWO_STAGE_TRAINING is True, you would typically:
+    # If config.TWO_STAGE_TRAINING is True, you would typically:
     # 1. Train Stage 1 (e.g., only prompts, or specific modules)
     #    trainer.fit(model_lightning, train_dataloader, val_dataloader)
     #    # Save checkpoint after stage 1
-    #    trainer.save_checkpoint(hparams.OUTPUT_DIR + "stage1_model.ckpt")
+    #    trainer.save_checkpoint(config.OUTPUT_DIR + "stage1_model.ckpt")
     #
     # 2. Load Stage 1 checkpoint, potentially unfreeze more layers/modules
     #    model_lightning_stage2 = HMRPTLightningModule.load_from_checkpoint(
-    #        hparams.OUTPUT_DIR + "stage1_model.ckpt",
-    #        hparams=hparams # Pass hparams again
+    #        config.OUTPUT_DIR + "stage1_model.ckpt",
+    #        hparams=config # Pass hparams again
     #    )
-    #    # Adjust optimizer for stage 2 (e.g., different learning rate, different modules frozen/unfrozen)
-    #    # trainer.fit(model_lightning_stage2, train_dataloader, val_dataloader, ckpt_path=hparams.OUTPUT_DIR + "stage1_model.ckpt")
+    #    # Adjust optimizer for stage 2 (e.g., different learning rate, unfreeze more params)
+    #    # trainer.fit(model_lightning_stage2, train_dataloader, val_dataloader, ckpt_path=config.OUTPUT_DIR + "stage1_model.ckpt")
     #    # This would require more complex logic in configure_optimizers or separate trainers.
 
 if __name__ == "__main__":
