@@ -58,7 +58,15 @@ class AdaptiveMaskRefinementModule(nn.Module):
         self.initial_conv = nn.Conv2d(input_channels, input_channels, kernel_size=1) # Project initial mask
         
         self.refinement_blocks = nn.ModuleList()
-        
+
+        for _ in range(refinement_steps):
+            self.refinement_blocks.append(
+                IterativeRefinementBlock(
+                    input_channels=input_channels, 
+                    embedding_dim=embedding_dim
+                )
+            )
+
         self.output_conv = nn.Conv2d(input_channels, output_channels, kernel_size=1)
 
     def forward(self, initial_pred_masks, image_features):

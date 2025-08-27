@@ -42,7 +42,7 @@ PROMPT_EMBEDDING_DIM = 256
 
 # --- Dataset Paths Configuration ---
 # IMPORTANT: Update these paths to where you extracted your datasets on the VM
-CITYSCAPES_ROOT = "/home/YOUR_USERNAME/Finetune-Mask2Former/data/cityscapes" #
+CITYSCAPES_ROOT = "/content/drive/MyDrive/Paper2/Dataset" #
 ADE20K_ROOT = "/home/YOUR_USERNAME/Finetune-Mask2Former/data/ade20k" #
 COCO_ROOT = "/home/YOUR_USERNAME/Finetune-Mask2Former/data/coco" #
 

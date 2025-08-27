@@ -1,75 +1,182 @@
-import torch
-from torch.utils.data import Dataset
-from PIL import Image
-import os
-import json
-from transformers import AutoImageProcessor # For Mask2Former's image processing [3]
+# hmr_pt/datasets/segmentation_dataset.py
 
-class CustomSegmentationDataset(Dataset):
-    def __init__(self, root_dir, image_dir, annotation_dir, image_processor, transform=None, task_type="semantic"):
+import os
+from PIL import Image
+import torch
+import json
+import numpy as np
+
+class CustomSegmentationDataset(torch.utils.data.Dataset):
+    """
+    Custom dataset for Cityscapes segmentation tasks (semantic, instance, panoptic).
+    This dataset handles loading images and annotations, applying the necessary
+    label remapping for Cityscapes, and preparing the data for the model.
+    """
+    # Cityscapes standard mapping from 34 raw IDs to 19 training IDs.
+    # All non-training IDs are mapped to 255, which is the ignore_index for the loss function.
+    id_to_train_id = np.array([255, 255, 255, 255, 255, 255, 255, 0, 1, 255, 255, 2, 3, 4, 255, 255, 255, 5, 255, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 255, 255, 16, 17, 18], dtype=np.uint8)
+
+    def __init__(self, root_dir, image_dir, annotation_dir, image_processor, task_type="semantic"):
         self.root_dir = root_dir
         self.image_dir = os.path.join(root_dir, image_dir)
         self.annotation_dir = os.path.join(root_dir, annotation_dir)
         self.image_processor = image_processor
-        self.transform = transform
         self.task_type = task_type
-        
-        self.image_paths = sorted([os.path.join(self.image_dir, f) for f in os.listdir(self.image_dir) if f.endswith(('.png', '.jpg', '.jpeg'))])
-        self.annotation_paths = sorted([os.path.join(self.annotation_dir, f) for f in os.listdir(self.annotation_dir) if f.endswith('.png')]) # Assuming mask images
+        self.images = []
+        self.annotations = []
 
-        # For Cityscapes, annotations are typically PNGs where pixel values map to class IDs [3]
-        # For instance/panoptic, COCO format JSONs are common [7, 8]
-        
-        # Example: For Cityscapes semantic segmentation, you'd load the semantic mask image
-        # For instance/panoptic, you'd parse COCO JSON to get masks and class IDs.
-        # This example assumes semantic segmentation with mask images.
+        # Find all corresponding image and annotation files
+        if task_type == "semantic" or task_type == "instance":
+            for city in os.listdir(self.image_dir):
+                city_image_path = os.path.join(self.image_dir, city)
+                if not os.path.isdir(city_image_path):
+                    continue
+                for filename in os.listdir(city_image_path):
+                    if filename.endswith("_leftImg8bit.png"):
+                        image_path = os.path.join(city_image_path, filename)
+                        base_filename = filename.replace("_leftImg8bit.png", "")
+                        if task_type == "semantic":
+                            annotation_filename = base_filename + "_gtFine_labelIds.png"
+                        else: # instance
+                            annotation_filename = base_filename + "_gtFine_instanceIds.png"
+                        annotation_path = os.path.join(self.annotation_dir, city, annotation_filename)
+                        if os.path.exists(annotation_path):
+                            self.images.append(image_path)
+                            self.annotations.append(annotation_path)
+        elif task_type == "panoptic":
+            panoptic_json_dir = os.path.join(self.annotation_dir)
+            for city in os.listdir(panoptic_json_dir):
+                 city_path = os.path.join(panoptic_json_dir, city)
+                 if not os.path.isdir(city_path):
+                     continue
+                 for filename in os.listdir(city_path):
+                     if filename.endswith('_gtPanoptic.json'):
+                         base_filename = filename.replace('_gtPanoptic.json', '')
+                         image_path = os.path.join(self.root_dir, 'leftImg8bit', city, base_filename + '_leftImg8bit.png')
+                         panoptic_map_path = os.path.join(city_path, base_filename + '_gtPanoptic.png')
+                         json_path = os.path.join(city_path, filename)
+                         if os.path.exists(image_path):
+                             self.images.append(image_path)
+                             self.annotations.append({"json_path": json_path, "panoptic_map_path": panoptic_map_path})
+        print(f"Loaded {len(self.images)} images for {self.task_type} segmentation.")
 
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.images)
 
     def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        ann_path = self.annotation_paths[idx]
+        image = Image.open(self.images[idx]).convert("RGB")
 
-        image = Image.open(img_path).convert("RGB")
-        mask = Image.open(ann_path).convert("L") # Load as grayscale for class IDs
+        if self.task_type == "semantic":
+            annotation = Image.open(self.annotations[idx]).convert("L")
+            semantic_map_array = np.array(annotation, dtype=np.uint8)
+            remapped_map_array = self.id_to_train_id[semantic_map_array]
+            remapped_map_pil = Image.fromarray(remapped_map_array)
 
-        # Apply transformations (e.g., resizing, normalization)
-        if self.transform:
-            image, mask = self.transform(image, mask) # Custom transform that handles both
+            # 🎯 CLEANUP: Removed the unsupported 'reduce_labels' argument.
+            inputs = self.image_processor(
+                images=image,
+                segmentation_maps=remapped_map_pil,
+                return_tensors="pt"
+            )
+            
+            inputs = {k: v.squeeze(0) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+            
+            if "labels" not in inputs and "mask_labels" in inputs and "class_labels" in inputs:
+                mask_labels_list = inputs.pop("mask_labels")
+                class_labels_list = inputs.pop("class_labels")
 
-        # Mask2Former's image processor handles resizing, normalization, etc.
-        # It expects a list of images and a list of annotations (e.g., dicts for panoptic)
-        # For semantic segmentation, it might expect a single mask tensor.
-        
-        # This part needs to align with Mask2Former's expected input format for labels
-        # For semantic segmentation, labels are typically (H, W) tensor of class IDs.
-        # The processor will handle image normalization and batching.
-        
-        # Example for semantic segmentation:
-        inputs = self.image_processor(images=image, segmentation_maps=mask, return_tensors="pt")
-        
-        # The pixel_values and pixel_mask are ready for the model
-        # The labels (segmentation_maps) are also processed by image_processor
+                if not mask_labels_list or not class_labels_list:
+                    h, w = inputs["pixel_values"].shape[1:]
+                    semantic_map = torch.full((h, w), fill_value=255, dtype=torch.long)
+                else:
+                    all_masks_tensor = mask_labels_list[0]
+                    all_class_ids_tensor = class_labels_list[0]
+                    
+                    h, w = all_masks_tensor.shape[-2:]
+                    semantic_map = torch.full((h, w), fill_value=255, dtype=torch.long)
+                    
+                    num_masks = all_masks_tensor.shape[0]
+                    for i in range(num_masks):
+                        mask = all_masks_tensor[i]
+                        class_id = all_class_ids_tensor[i]
+
+                        if class_id.item() > 18 and class_id.item() != 255:
+                            continue
+
+                        boolean_mask = (mask > 0.5)
+                        
+                        if boolean_mask.dim() > 2:
+                            boolean_mask = boolean_mask.any(dim=0)
+                        
+                        if boolean_mask.shape == semantic_map.shape:
+                            semantic_map[boolean_mask] = class_id.item()
+                        
+                inputs["labels"] = semantic_map
+
+            if "labels" not in inputs or not isinstance(inputs.get("labels"), torch.Tensor):
+                raise TypeError(f"Label for semantic task could not be constructed. Processor output keys: {inputs.keys()}")
+
+            return inputs
+
+        elif self.task_type == "instance":
+            instance_map = Image.open(self.annotations[idx])
+            instance_map_array = np.array(instance_map)
+            instance_ids = np.unique(instance_map_array)
+            annotations = []
+            for instance_id in instance_ids:
+                if instance_id < 1000:
+                    continue
+                class_id = instance_id // 1000
+                mask = (instance_map_array == instance_id)
+                annotations.append(dict(segmentation=mask, iscrowd=0, category_id=class_id))
+            
+            inputs = self.image_processor(images=image, annotations=annotations, return_tensors="pt")
+            inputs = {k: v.squeeze(0) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+            
+            if "mask_labels" in inputs:
+                inputs["labels"] = {
+                    "mask_labels": inputs.pop("mask_labels"),
+                    "class_labels": inputs.pop("class_labels"),
+                }
+            return inputs
+
+        elif self.task_type == "panoptic":
+            annotation_data = self.annotations[idx]
+            panoptic_map = Image.open(annotation_data["panoptic_map_path"])
+            with open(annotation_data["json_path"], 'r') as f:
+                segments_info = json.load(f)["segments_info"]
+            
+            inputs = self.image_processor(images=image, segmentation_map=panoptic_map, segments_info=segments_info, return_tensors="pt")
+            inputs = {k: v.squeeze(0) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+            
+            if "mask_labels" in inputs:
+                inputs["labels"] = {
+                    "mask_labels": inputs.pop("mask_labels"),
+                    "class_labels": inputs.pop("class_labels"),
+                }
+            return inputs
+
+
+def collate_fn(batch, image_processor, task_type="semantic"):
+    """
+    Collates data from the dataset into a batch.
+    """
+    pixel_values = torch.stack([item["pixel_values"] for item in batch])
+    pixel_mask = torch.stack([item["pixel_mask"] for item in batch])
+
+    if task_type == "semantic":
+        labels = torch.stack([item["labels"] for item in batch])
         return {
-            "pixel_values": inputs["pixel_values"].squeeze(0), # Remove batch dim for single image
-            "pixel_mask": inputs["pixel_mask"].squeeze(0),
-            "labels": inputs["labels"].squeeze(0) # This is the processed segmentation map
+            "pixel_values": pixel_values,
+            "pixel_mask": pixel_mask,
+            "labels": labels,
         }
-
-# Collate function for DataLoader (if needed, depending on processor usage)
-def collate_fn(batch, image_processor):
-    pixel_values = [item["pixel_values"] for item in batch]
-    pixel_mask = [item["pixel_mask"] for item in batch]
-    labels = [item["labels"] for item in batch]
-
-    # Use image_processor's batching capabilities if it supports it for labels
-    # Otherwise, manually pad/stack
-    # For Mask2Former, the processor often handles this during __getitem__
-    # So, here we just stack the already processed tensors.
-    
-    return {
-        "pixel_values": torch.stack(pixel_values),
-        "pixel_mask": torch.stack(pixel_mask),
-        "labels": torch.stack(labels)
+    elif task_type in ["instance", "panoptic"]:
+        labels = [item["labels"] for item in batch]
+        return {
+            "pixel_values": pixel_values,
+            "pixel_mask": pixel_mask,
+            "labels": labels,
         }
+    else:
+        raise ValueError(f"Unsupported task_type: {task_type}")
