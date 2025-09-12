@@ -7,7 +7,7 @@ from functools import partial
 import lightning as L
 from lightning.pytorch.loggers import CSVLogger
 from lightning.pytorch.callbacks import ModelCheckpoint
-# 🎯 Swapping to a more reliable metrics library
+#  Swapping to a more reliable metrics library
 from torchmetrics.classification import MulticlassJaccardIndex
 import numpy as np
 from PIL import Image
@@ -106,6 +106,17 @@ class HMRPTLightningModule(L.LightningModule):
         return optimizer
 
 def main():
+    # --- NEW CODE START: Add ArgumentParser ---
+    parser = argparse.ArgumentParser(description="HMR-PT Training Script")
+    parser.add_argument(
+        '--resume_from_checkpoint',
+        type=str,
+        default=None,
+        help="Path to the checkpoint file to resume training from (e.g., 'output/last.ckpt')."
+    )
+    args = parser.parse_args()
+    # --- NEW CODE END ---
+
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
     hparams = argparse.Namespace(**{key: getattr(config, key) for key in dir(config) if not key.startswith('__')})
 
@@ -167,11 +178,21 @@ def main():
         accelerator="gpu",
         devices=1,
         log_every_n_steps=50,
-        val_check_interval=0.5,
+        val_check_interval=1.0,
     )
+  
+    # --- NEW CODE START: Add conditional print statements ---
+    if args.resume_from_checkpoint:
+        print(f"Resuming training from checkpoint: {args.resume_from_checkpoint}")
+    else:
+        print("Starting training from scratch.")
+    # --- NEW CODE END ---
 
     print(f"Starting training for {hparams.NUM_EPOCHS} epochs...", flush=True)
-    trainer.fit(model_lightning, train_dataloader, val_dataloader)
+    #trainer.fit(model_lightning, train_dataloader, val_dataloader)
+    # --- MODIFIED LINE: Pass the checkpoint path to trainer.fit() ---
+    trainer.fit(model_lightning, train_dataloader, val_dataloader, ckpt_path=args.resume_from_checkpoint)
+
     print("Training complete!", flush=True)
 
 if __name__ == "__main__":

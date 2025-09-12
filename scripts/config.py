@@ -17,7 +17,8 @@ LEARNING_RATE = 1e-5
 OPTIMIZER = "AdamW"
 
 # Path to save trained models and logs
-OUTPUT_DIR = "../output/" # [1]
+#OUTPUT_DIR = "../output/" # [1]
+OUTPUT_DIR = f"output/{TASK_TYPE}/" # Use an f-string to include the task type in the path
 MODEL_SAVE_PATH = OUTPUT_DIR + "Mask2Former.ckpt" # [1]
 
 # Image size for resizing (e.g., 512 for smaller datasets, 1024 for Cityscapes)
