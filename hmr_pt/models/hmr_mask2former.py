@@ -3,19 +3,18 @@
 import torch
 import torch.nn as nn
 from transformers import Mask2FormerForUniversalSegmentation, AutoImageProcessor
-from functools import partial
 import copy
+from functools import partial
 
 from hmr_pt.models.prompt_modules import HierarchicalPromptLayer, SemanticPromptInitializer
 from hmr_pt.models.refinement_module import AdaptiveMaskRefinementModule
 from hmr_pt.losses.hmr_losses import HMRLoss
+from config import CITYSCAPES_19_CLASSES
 
 class HMRMask2Former(nn.Module):
     def __init__(self, model_name="facebook/mask2former-swin-tiny-cityscapes-semantic",
                  num_classes=19,
                  prompt_length_coarse=10,
-                 prompt_length_fine=5,
-                 num_decoder_layers=6,
                  refinement_steps=3,
                  prompt_embedding_dim=256,
                  semantic_init_vlm_model="openai/clip-vit-base-patch32",
@@ -33,13 +32,12 @@ class HMRMask2Former(nn.Module):
         
         self.num_classes = num_classes
         self.prompt_embedding_dim = prompt_embedding_dim
-
-        self.num_decoder_layers = 9
-        self.hierarchical_prompts = nn.ModuleList()
-        for i in range(self.num_decoder_layers):
-            self.hierarchical_prompts.append(
-                HierarchicalPromptLayer(prompt_length_coarse, prompt_embedding_dim)
-            )
+        self.num_decoder_layers = 9 
+        
+        self.hierarchical_prompts = nn.ModuleList([
+            HierarchicalPromptLayer(prompt_length_coarse, prompt_embedding_dim)
+            for _ in range(self.num_decoder_layers)
+        ])
 
         self.new_class_predictor = nn.Linear(self.prompt_embedding_dim, self.num_classes + 1)
         self.new_mask_embedder = copy.deepcopy(self.mask2former.model.transformer_module.decoder.mask_predictor.mask_embedder)
@@ -50,6 +48,13 @@ class HMRMask2Former(nn.Module):
             embedding_dim=prompt_embedding_dim,
             refinement_steps=refinement_steps
         )
+
+        self.semantic_initializer = SemanticPromptInitializer(
+            num_classes=len(CITYSCAPES_19_CLASSES),
+            prompt_embedding_dim=prompt_embedding_dim,
+            vlm_model_name=semantic_init_vlm_model
+        )
+        self.initialize_prompts_semantically(CITYSCAPES_19_CLASSES)
         
         self.criterion = HMRLoss(
             num_classes=num_classes,
@@ -58,61 +63,82 @@ class HMRMask2Former(nn.Module):
             lambda_boundary=lambda_boundary,
             lambda_contrastive=lambda_contrastive
         )
+        
+        # This is the new, robust method to inject prompts
+        self._inject_prompts_into_decoder()
 
-# In the HMRMask2Former class, replace the entire 'forward' method with this one:
+    def initialize_prompts_semantically(self, class_names):
+        semantic_prompts = self.semantic_initializer(class_names)
+        with torch.no_grad():
+            for prompt_layer in self.hierarchical_prompts:
+                num_prompts_in_layer = prompt_layer.prompts.shape[1]
+                indices = torch.randint(0, len(class_names), (num_prompts_in_layer,))
+                selected_prompts = semantic_prompts[indices]
+                prompt_layer.prompts.data = selected_prompts.unsqueeze(0)
+
+    def _create_prompted_forward(self, original_forward, prompt_layer):
+        # This is a wrapper function. It takes the original forward method of a decoder layer
+        # and returns a NEW forward method that first applies our prompts.
+        def prompted_forward(*args, **kwargs):
+            # The queries are the first argument ('hidden_states')
+            queries = args[0]
+            
+            # Apply our learnable prompt
+            prompted_queries = prompt_layer(queries)
+            
+            # Replace the original queries with our prompted ones
+            new_args = (prompted_queries,) + args[1:]
+            
+            # Call the original decoder layer's forward method with the prompted queries
+            return original_forward(*new_args, **kwargs)
+        
+        return prompted_forward
+
+    def _inject_prompts_into_decoder(self):
+        # Iterate through each of the 9 decoder layers
+        decoder_layers = self.mask2former.model.transformer_module.decoder.layers
+        for i, layer in enumerate(decoder_layers):
+            # Get the original forward method of this layer
+            original_forward = layer.forward
+            
+            # Create a new, prompted forward method using our wrapper
+            prompted_forward_func = self._create_prompted_forward(original_forward, self.hierarchical_prompts[i])
+            
+            # Replace the layer's original forward method with our new one
+            layer.forward = prompted_forward_func
+
     def forward(self, pixel_values, pixel_mask=None, labels=None, task_type="semantic"):
-        # 1. Get base model outputs
+        # With the prompts injected, we can now call the model in a much simpler way
         outputs = self.mask2former(
             pixel_values=pixel_values,
             pixel_mask=pixel_mask,
-            output_hidden_states=True,
+            output_hidden_states=True, # We still need the hidden states
             return_dict=True
         )
         
-        decoder_hidden_states = outputs.transformer_decoder_hidden_states
-        mask_embed = outputs.pixel_decoder_last_hidden_state
-
-        # 2. Apply hierarchical prompts to create 'modified_queries'
-        modified_queries = decoder_hidden_states[0]
-        for i, (layer_output, prompt_layer) in enumerate(zip(decoder_hidden_states, self.hierarchical_prompts)):
-             modified_queries = prompt_layer(layer_output)
-
-        # 3. Permute queries for downstream modules
-        modified_queries = modified_queries.permute(1, 0, 2)
+        # The decoder has now run with our prompts. We can get the final queries.
+        final_queries = outputs.transformer_decoder_hidden_states[-1]
+        final_queries_permuted = final_queries.permute(1, 0, 2)
         
-        # 4. Use 'modified_queries' to get class and mask predictions
-        initial_class_logits = self.new_class_predictor(modified_queries)
-        mask_embeddings = self.new_mask_embedder(modified_queries)
+        mask_embed = outputs.pixel_decoder_last_hidden_state
+        
+        # Use the prompted final queries to get predictions
+        initial_class_logits = self.new_class_predictor(final_queries_permuted)
+        mask_embeddings = self.new_mask_embedder(final_queries_permuted)
         initial_pred_masks = torch.einsum("bqc,bchw->bqhw", mask_embeddings, mask_embed)
 
         class_logits = initial_class_logits[:, :, :self.num_classes]
-        
         mask_logits_reshaped = initial_pred_masks.flatten(2)
-
-        # 5. Apply softmax to normalize mask predictions and prevent exploding loss
         mask_probs_reshaped = torch.softmax(mask_logits_reshaped, dim=1)
-        
-        # 6. Create the initial semantic mask using normalized probabilities
         semantic_initial_masks_flat = torch.einsum("bqc,bqw->bcw", class_logits, mask_probs_reshaped)
-
         height, width = initial_pred_masks.shape[-2:]
+        
         semantic_initial_masks = semantic_initial_masks_flat.view(-1, self.num_classes, height, width)
 
-        # 7. Refine the mask
-        refined_pred_masks = self.refinement_module(semantic_initial_masks, pixel_values)
+        refined_pred_masks = self.refinement_module(semantic_initial_masks, mask_embed)
 
-        # 8. Calculate loss if labels are provided
         loss = None
         if labels is not None:
-            ## [TRACE] Print the shapes of all tensors being passed to the loss function
-            #print(
-            #    f"\n[TRACE] Shapes before loss calculation:\n"
-            #    f"  - Initial Pred Masks: {semantic_initial_masks.shape}\n"
-            #    f"  - Refined Pred Masks: {refined_pred_masks.shape}\n"
-            #    f"  - Initial Class Logits: {initial_class_logits.shape}\n"
-            #    f"  - Labels: {labels.shape}"
-            #)
-
             loss = self.criterion(
                 initial_pred_masks=semantic_initial_masks,
                 refined_pred_masks=refined_pred_masks,
@@ -122,7 +148,7 @@ class HMRMask2Former(nn.Module):
 
         return {
             "loss": loss,
-            "initial_pred_masks": initial_pred_masks,
+            "initial_pred_masks": semantic_initial_masks,
             "refined_pred_masks": refined_pred_masks,
             "class_logits": class_logits
         }

@@ -7,12 +7,12 @@ from functools import partial
 import lightning as L
 from lightning.pytorch.loggers import CSVLogger
 from lightning.pytorch.callbacks import ModelCheckpoint
-#  Swapping to a more reliable metrics library
 from torchmetrics.classification import MulticlassJaccardIndex
 import numpy as np
 from PIL import Image
 import argparse
 import sys
+from transformers import AutoImageProcessor
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
@@ -24,13 +24,14 @@ from hmr_pt.losses.hmr_losses import HMRLoss
 class HMRPTLightningModule(L.LightningModule):
     def __init__(self, hparams):
         super().__init__()
-        self.save_hyperparameters(hparams) 
+        self.save_hyperparameters(hparams)
+        # --- FIX: Use getattr() to safely access the attribute ---
+        self.steps_per_epoch = getattr(hparams, "steps_per_epoch", 0)
 
         self.model = HMRMask2Former(
             model_name=hparams.MODEL_NAME,
             num_classes=hparams.NUM_CLASSES,
             prompt_length_coarse=hparams.PROMPT_LENGTH_COARSE,
-            prompt_length_fine=hparams.PROMPT_LENGTH_FINE,
             refinement_steps=hparams.REFINEMENT_STEPS,
             prompt_embedding_dim=hparams.PROMPT_EMBEDDING_DIM,
             semantic_init_vlm_model=hparams.SEMANTIC_INIT_VLM_MODEL
@@ -38,11 +39,9 @@ class HMRPTLightningModule(L.LightningModule):
 
         self.task_type = hparams.TASK_TYPE
         if self.task_type == "semantic":
-            # 🎯 DEFINITIVE FIX: Use torchmetrics for stable and direct tensor-based metric calculation.
-            # MulticlassJaccardIndex is the official name for Mean IoU.
             self.val_mean_iou = MulticlassJaccardIndex(
-                num_classes=hparams.NUM_CLASSES, 
-                ignore_index=255 # Cityscapes ignore index
+                num_classes=hparams.NUM_CLASSES,
+                ignore_index=255
             )
         else:
             raise ValueError(f"Unsupported TASK_TYPE for evaluation: {self.task_type}")
@@ -56,9 +55,8 @@ class HMRPTLightningModule(L.LightningModule):
         labels = batch["labels"]
 
         outputs = self.model(pixel_values=pixel_values, pixel_mask=pixel_mask, labels=labels, task_type=self.task_type)
-        
         loss = outputs["loss"]
-        
+
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss
 
@@ -68,15 +66,12 @@ class HMRPTLightningModule(L.LightningModule):
         labels = batch["labels"]
 
         outputs = self.model(pixel_values=pixel_values, pixel_mask=pixel_mask, labels=labels, task_type=self.task_type)
-
         loss = outputs["loss"]
-        
+
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
         if self.task_type == "semantic":
             low_res_logits = outputs["refined_pred_masks"]
-
-            # Upsample predicted logits to match the label's spatial dimensions.
             upsampled_logits = nn.functional.interpolate(
                 low_res_logits,
                 size=labels.shape[-2:],
@@ -84,29 +79,41 @@ class HMRPTLightningModule(L.LightningModule):
                 align_corners=False
             )
             predicted_masks = upsampled_logits.argmax(dim=1)
-
-            # 🎯 Update metric directly with tensors. No more conversions needed.
             self.val_mean_iou.update(predicted_masks, labels)
 
     def on_validation_epoch_end(self):
         if self.task_type == "semantic":
-            # 🎯 Compute and log the metric from torchmetrics.
             mean_iou = self.val_mean_iou.compute()
             self.log("val_mean_iou", mean_iou, prog_bar=True, logger=True)
-            
-            # The metric state is automatically reset at the start of the next epoch.
 
     def configure_optimizers(self):
-        # Filter parameters to only optimize those that require gradients
         trainable_params = filter(lambda p: p.requires_grad, self.model.parameters())
+
         if self.hparams.OPTIMIZER == "AdamW":
             optimizer = optim.AdamW(trainable_params, lr=self.hparams.LEARNING_RATE)
         else:
             optimizer = optim.SGD(trainable_params, lr=self.hparams.LEARNING_RATE)
-        return optimizer
+
+        if self.steps_per_epoch == 0:
+            raise ValueError("steps_per_epoch is not set, which is needed for the scheduler.")
+
+        total_steps = self.steps_per_epoch * self.hparams.NUM_EPOCHS
+
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=self.hparams.LEARNING_RATE,
+            total_steps=total_steps,
+        )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+            },
+        }
 
 def main():
-    # --- NEW CODE START: Add ArgumentParser ---
     parser = argparse.ArgumentParser(description="HMR-PT Training Script")
     parser.add_argument(
         '--resume_from_checkpoint',
@@ -115,34 +122,32 @@ def main():
         help="Path to the checkpoint file to resume training from (e.g., 'output/last.ckpt')."
     )
     args = parser.parse_args()
-    # --- NEW CODE END ---
 
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
     hparams = argparse.Namespace(**{key: getattr(config, key) for key in dir(config) if not key.startswith('__')})
 
-    model_lightning = HMRPTLightningModule(hparams=hparams)
-    image_processor = model_lightning.model.processor
+    image_processor_for_datasets = AutoImageProcessor.from_pretrained(hparams.MODEL_NAME)
 
     if hparams.TASK_TYPE == "semantic":
         train_dataset = CustomSegmentationDataset(
             root_dir=hparams.CITYSCAPES_ROOT,
             image_dir="leftImg8bit/train",
             annotation_dir="gtFine/train",
-            image_processor=image_processor,
+            image_processor=image_processor_for_datasets,
             task_type=hparams.TASK_TYPE
         )
         val_dataset = CustomSegmentationDataset(
             root_dir=hparams.CITYSCAPES_ROOT,
             image_dir="leftImg8bit/val",
             annotation_dir="gtFine/val",
-            image_processor=image_processor,
+            image_processor=image_processor_for_datasets,
             task_type=hparams.TASK_TYPE
         )
     else:
         raise ValueError(f"Unsupported TASK_TYPE: {hparams.TASK_TYPE}")
 
-    train_collate_fn = partial(collate_fn, image_processor=image_processor, task_type=hparams.TASK_TYPE)
-    val_collate_fn = partial(collate_fn, image_processor=image_processor, task_type=hparams.TASK_TYPE)
+    train_collate_fn = partial(collate_fn, image_processor=image_processor_for_datasets, task_type=hparams.TASK_TYPE)
+    val_collate_fn = partial(collate_fn, image_processor=image_processor_for_datasets, task_type=hparams.TASK_TYPE)
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -152,6 +157,9 @@ def main():
         collate_fn=train_collate_fn,
         pin_memory=True
     )
+
+    hparams.steps_per_epoch = len(train_dataloader)
+
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=hparams.BATCH_SIZE,
@@ -160,6 +168,8 @@ def main():
         collate_fn=val_collate_fn,
         pin_memory=True
     )
+
+    model_lightning = HMRPTLightningModule(hparams=hparams)
 
     csv_logger = CSVLogger(save_dir=hparams.OUTPUT_DIR, name="hmr_pt_logs")
     checkpoint_callback = ModelCheckpoint(
@@ -180,17 +190,13 @@ def main():
         log_every_n_steps=50,
         val_check_interval=1.0,
     )
-  
-    # --- NEW CODE START: Add conditional print statements ---
+
     if args.resume_from_checkpoint:
         print(f"Resuming training from checkpoint: {args.resume_from_checkpoint}")
     else:
         print("Starting training from scratch.")
-    # --- NEW CODE END ---
 
     print(f"Starting training for {hparams.NUM_EPOCHS} epochs...", flush=True)
-    #trainer.fit(model_lightning, train_dataloader, val_dataloader)
-    # --- MODIFIED LINE: Pass the checkpoint path to trainer.fit() ---
     trainer.fit(model_lightning, train_dataloader, val_dataloader, ckpt_path=args.resume_from_checkpoint)
 
     print("Training complete!", flush=True)

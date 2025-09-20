@@ -11,7 +11,7 @@ NUM_EPOCHS = 50
 BATCH_SIZE = 4
 
 # Learning rate for the optimizer
-LEARNING_RATE = 1e-5
+LEARNING_RATE = 1e-4
 
 # Optimizer choice (e.g., "AdamW", "SGD")
 OPTIMIZER = "AdamW"
