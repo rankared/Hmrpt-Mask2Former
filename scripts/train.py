@@ -86,6 +86,37 @@ class HMRPTLightningModule(L.LightningModule):
             mean_iou = self.val_mean_iou.compute()
             self.log("val_mean_iou", mean_iou, prog_bar=True, logger=True)
 
+    # --- ADD THIS METHOD ---
+    def test_step(self, batch, batch_idx):
+        # This is the same logic as validation_step
+        pixel_values = batch["pixel_values"]
+        pixel_mask = batch["pixel_mask"]
+        labels = batch["labels"]
+
+        outputs = self.model(pixel_values=pixel_values, pixel_mask=pixel_mask, labels=labels, task_type=self.task_type)
+        loss = outputs["loss"]
+        
+        self.log("test_loss", loss, on_step=False, on_epoch=True)
+
+        if self.task_type == "semantic":
+            low_res_logits = outputs["refined_pred_masks"]
+            upsampled_logits = nn.functional.interpolate(
+                low_res_logits,
+                size=labels.shape[-2:],
+                mode="bilinear",
+                align_corners=False
+            )
+            predicted_masks = upsampled_logits.argmax(dim=1)
+            self.val_mean_iou.update(predicted_masks, labels)
+
+    # --- AND ADD THIS METHOD ---
+    def on_test_epoch_end(self):
+        # This is the same logic as on_validation_epoch_end
+        if self.task_type == "semantic":
+            mean_iou = self.val_mean_iou.compute()
+            self.log("test_mean_iou", mean_iou, prog_bar=True)
+
+
     def configure_optimizers(self):
         trainable_params = filter(lambda p: p.requires_grad, self.model.parameters())
 
@@ -134,14 +165,16 @@ def main():
             image_dir="leftImg8bit/train",
             annotation_dir="gtFine/train",
             image_processor=image_processor_for_datasets,
-            task_type=hparams.TASK_TYPE
+            task_type=hparams.TASK_TYPE,
+            is_train=True
         )
         val_dataset = CustomSegmentationDataset(
             root_dir=hparams.CITYSCAPES_ROOT,
             image_dir="leftImg8bit/val",
             annotation_dir="gtFine/val",
             image_processor=image_processor_for_datasets,
-            task_type=hparams.TASK_TYPE
+            task_type=hparams.TASK_TYPE,
+            is_train=False
         )
     else:
         raise ValueError(f"Unsupported TASK_TYPE: {hparams.TASK_TYPE}")

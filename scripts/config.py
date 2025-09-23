@@ -31,7 +31,7 @@ IMAGE_SIZE = (1024, 1024) # Cityscapes resolution is 1024x2048, so adjust as nee
 # "facebook/mask2former-swin-tiny-cityscapes-semantic" [4]
 # "facebook/mask2former-swin-base-cityscapes-semantic"
 # "facebook/mask2former-swin-large-cityscapes-semantic"
-MODEL_NAME = "facebook/mask2former-swin-tiny-cityscapes-semantic"
+MODEL_NAME = "facebook/mask2former-swin-large-cityscapes-semantic"
 
 # Number of classes for your specific dataset
 # For Cityscapes semantic segmentation, it's 19 (or 30 if including ignored classes)
