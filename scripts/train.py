@@ -21,6 +21,70 @@ from hmr_pt.models.hmr_mask2former import HMRMask2Former
 from hmr_pt.datasets.segmentation_dataset import CustomSegmentationDataset, collate_fn
 from hmr_pt.losses.hmr_losses import HMRLoss
 
+# New class to add to train.py
+class VisualizationCallback(L.Callback):
+    def __init__(self, dataloader, output_dir, num_samples=4):
+        super().__init__()
+        self.dataloader = dataloader
+        self.output_dir = output_dir
+        self.num_samples = num_samples
+        self.color_map = config.LABEL_COLORS_CITYSCAPES
+
+        # Get a fixed batch from the dataloader
+        self.fixed_batch = next(iter(self.dataloader))
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        vis_dir = os.path.join(self.output_dir, "visualizations", f"epoch_{trainer.current_epoch}")
+        os.makedirs(vis_dir, exist_ok=True)
+
+        pixel_values = self.fixed_batch["pixel_values"][:self.num_samples].to(pl_module.device)
+        labels = self.fixed_batch["labels"][:self.num_samples]
+
+        # Get model predictions
+        pl_module.eval()
+        with torch.no_grad():
+            outputs = pl_module(pixel_values=pixel_values, pixel_mask=None)
+        pl_module.train()
+
+        # Upsample logits and get predictions
+        low_res_logits = outputs["refined_pred_masks"]
+        upsampled_logits = nn.functional.interpolate(
+            low_res_logits,
+            size=labels.shape[-2:],
+            mode="bilinear",
+            align_corners=False
+        )
+        predictions = upsampled_logits.argmax(dim=1).cpu().numpy()
+
+        # Get processor from the model to denormalize
+        processor = AutoImageProcessor.from_pretrained(pl_module.hparams.MODEL_NAME)
+        mean = torch.tensor(processor.image_mean).view(1, 3, 1, 1)
+        std = torch.tensor(processor.image_std).view(1, 3, 1, 1)
+
+        # Save each image, gt, and pred
+        for i in range(self.num_samples):
+            img_tensor = pixel_values[i].cpu() * std + mean
+            img_numpy = (img_tensor.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            img_pil = Image.fromarray(img_numpy)
+
+            gt_mask = labels[i].numpy()
+            pred_mask = predictions[i]
+
+            target_size = (gt_mask.shape[1], gt_mask.shape[0])
+            img_tensor_resized = np.array(img_pil.resize(target_size))
+
+            gt_colored = np.zeros((*gt_mask.shape, 3), dtype=np.uint8)
+            pred_colored = np.zeros((*pred_mask.shape, 3), dtype=np.uint8)
+
+            for label_id, color in enumerate(self.color_map):
+                gt_colored[gt_mask == label_id] = color
+                pred_colored[pred_mask == label_id] = color
+
+            concatenated_image = Image.fromarray(np.concatenate(
+                [img_tensor_resized, gt_colored, pred_colored], axis=1
+            ))
+            concatenated_image.save(os.path.join(vis_dir, f"example_{i}.png"))
+
 class HMRPTLightningModule(L.LightningModule):
     def __init__(self, hparams):
         super().__init__()
@@ -116,7 +180,6 @@ class HMRPTLightningModule(L.LightningModule):
             mean_iou = self.val_mean_iou.compute()
             self.log("test_mean_iou", mean_iou, prog_bar=True)
 
-
     def configure_optimizers(self):
         trainable_params = filter(lambda p: p.requires_grad, self.model.parameters())
 
@@ -128,12 +191,15 @@ class HMRPTLightningModule(L.LightningModule):
         if self.steps_per_epoch == 0:
             raise ValueError("steps_per_epoch is not set, which is needed for the scheduler.")
 
-        total_steps = self.steps_per_epoch * self.hparams.NUM_EPOCHS
-
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        # --- Use CosineAnnealingWarmRestarts with a 5-epoch cycle ---
+        # T_0 is the number of epochs for the first restart cycle.
+        first_cycle_steps = self.steps_per_epoch * 5 
+        
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer,
-            max_lr=self.hparams.LEARNING_RATE,
-            total_steps=total_steps,
+            T_0=first_cycle_steps,
+            T_mult=1, # T_mult=1 means each restart cycle will also be 5 epochs long
+            eta_min=1e-6
         )
 
         return {
@@ -143,6 +209,8 @@ class HMRPTLightningModule(L.LightningModule):
                 "interval": "step",
             },
         }
+
+
 
 def main():
     parser = argparse.ArgumentParser(description="HMR-PT Training Script")
@@ -157,7 +225,12 @@ def main():
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
     hparams = argparse.Namespace(**{key: getattr(config, key) for key in dir(config) if not key.startswith('__')})
 
-    image_processor_for_datasets = AutoImageProcessor.from_pretrained(hparams.MODEL_NAME)
+    #image_processor_for_datasets = AutoImageProcessor.from_pretrained(hparams.MODEL_NAME)
+    # After
+    image_processor_for_datasets = AutoImageProcessor.from_pretrained(
+        hparams.MODEL_NAME,
+        size={"height": 1024, "width": 2048}
+    )
 
     if hparams.TASK_TYPE == "semantic":
         train_dataset = CustomSegmentationDataset(
@@ -179,8 +252,12 @@ def main():
     else:
         raise ValueError(f"Unsupported TASK_TYPE: {hparams.TASK_TYPE}")
 
-    train_collate_fn = partial(collate_fn, image_processor=image_processor_for_datasets, task_type=hparams.TASK_TYPE)
-    val_collate_fn = partial(collate_fn, image_processor=image_processor_for_datasets, task_type=hparams.TASK_TYPE)
+    #train_collate_fn = partial(collate_fn, image_processor=image_processor_for_datasets, task_type=hparams.TASK_TYPE)
+    #val_collate_fn = partial(collate_fn, image_processor=image_processor_for_datasets, task_type=hparams.TASK_TYPE)
+
+    # AFTER
+    train_collate_fn = partial(collate_fn, image_processor=image_processor_for_datasets)
+    val_collate_fn = partial(collate_fn, image_processor=image_processor_for_datasets)
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -214,10 +291,12 @@ def main():
         save_last=True
     )
 
+    vis_callback = VisualizationCallback(val_dataloader, hparams.OUTPUT_DIR)
+
     trainer = L.Trainer(
         max_epochs=hparams.NUM_EPOCHS,
         logger=csv_logger,
-        callbacks=[checkpoint_callback],
+        callbacks=[checkpoint_callback, vis_callback],
         accelerator="gpu",
         devices=1,
         log_every_n_steps=50,
